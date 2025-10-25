@@ -1,4 +1,8 @@
-Here’s a drop-in **README** section you can paste so everyone follows the same flow.
+| Area     | Owner(s)                       | Responsibilities                                                                              | Branch Prefix  |
+| -------- | ------------------------------ | --------------------------------------------------------------------------------------------- | -------------- |
+| Infra/AI | @Johnathanamidi1919, @shaamirf | AWS SAM, DynamoDB, EventBridge, SNS; Bedrock/Textract; parsing pipeline; secrets; deployments | `infra/` `ai/` |
+| Backend  | @Nathan10101010, @aveedg       | API Gateway + Lambdas (`/latest`, `/search`); scrapers; dedupe/upsert; notifier               | `be/`          |
+| Frontend | @dylanh-2                      | React dashboard (list, filters, impact badges); API wiring; demo view                         | `fe/`          |
 
 ---
 
