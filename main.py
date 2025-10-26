@@ -61,6 +61,9 @@ class PromptRequest(BaseModel):
     companyDetails: str | None = None
     companyLocation: str | None = None
     exportLocations: list[str] | None = None
+    # Optional runtime model parameters (not required)
+    temperature: float | None = None
+    max_tokens: int | None = None
 
 @app.post("/api/check-ai")
 async def check_ai_content(request: PromptRequest):
@@ -81,20 +84,48 @@ async def options_check_ai():
 
 @app.post("/api/bedrock")
 async def call_bedrock_with_validation(request: PromptRequest):
+    # Build a richer prompt that includes context from the form
+    def build_prompt(req: PromptRequest) -> str:
+        parts = []
+        if req.companyDetails:
+            parts.append(f"Company details: {req.companyDetails}")
+        if req.companyLocation:
+            parts.append(f"Company location: {req.companyLocation}")
+        if req.exportLocations:
+            parts.append(f"Export locations: {', '.join(req.exportLocations)}")
+
+        # A short system/instructional prefix to guide the model's behavior
+        system_instructions = (
+            "You are an expert export compliance assistant. Answer concisely and clearly. "
+            "When appropriate, list actionable steps and ask clarifying questions."
+        )
+
+        user_prompt = req.prompt.strip()
+        # Combine system, context, and user prompt into a single message string
+        combined = "\n\n".join([system_instructions, "Context:", "\n".join(parts), "User request:", user_prompt])
+        return combined
+
+    prompt_text = build_prompt(request)
+
+    # Allow callers to override temperature / max_tokens via the request (or fall back to defaults)
+    temperature = request.temperature if request.temperature is not None else 0.2
+    max_tokens = request.max_tokens if request.max_tokens is not None else 1000
+
+    # The Bedrock Messages API expects user messages in `messages` and a top-level
+    # system/instruction parameter (if used) rather than a message with role="system".
+    # We already incorporate system instructions into `prompt_text`, so only send a
+    # user message here to avoid validation errors.
     body = {
         "anthropic_version": "bedrock-2023-05-31",
         "messages": [
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": request.prompt,
-                    }
-                ],
-            }
+                "content": [{"type": "text", "text": prompt_text}],
+            },
         ],
-        "max_tokens": 1000,
+        # Model generation controls (may be model-specific)
+        "max_tokens": max_tokens,
+        "temperature": temperature,
     }
 
     try:
