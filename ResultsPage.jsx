@@ -243,10 +243,9 @@ function LookupBox({ initialQuery = '', initialBucket = 'tsinfo', initialKeyPath
   return (
     <div className="space-y-4">
       <form onSubmit={doLookup} className="space-y-3">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <input value={bucket} onChange={(e) => setBucket(e.target.value)} className="col-span-1 bg-[#121212] text-gray-200 px-3 py-2 rounded-lg border border-[#303030]" />
-          <input value={keyPath} onChange={(e) => setKeyPath(e.target.value)} className="col-span-2 bg-[#121212] text-gray-200 px-3 py-2 rounded-lg border border-[#303030]" />
-        </div>
+        {/* bucket/key are hidden on the results page UI but kept in state for lookups */}
+        <input type="hidden" value={bucket} />
+        <input type="hidden" value={keyPath} />
         <textarea
           value={query}
           onChange={(e) => setQuery(e.target.value)}
