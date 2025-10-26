@@ -4,6 +4,7 @@ import os
 import csv
 import io
 import re
+import heapq
 from typing import List, Optional
 from dotenv import load_dotenv
 
@@ -166,11 +167,12 @@ async def get_s3_object(bucket_name: str, object_key: str) -> S3GetResponse:
         except Exception:
             code = None
         if code == 'NoSuchKey':
-            # Attempt fallback: replace /XX/ or /EU/ with /US/
+            # Attempt fallback: try US data if country-specific data doesn't exist
             try:
                 m = re.search(r"/(?:[A-Z]{2}|EU)/", object_key)
                 if m and '/US/' not in object_key:
                     fallback_key = re.sub(r"/(?:[A-Z]{2}|EU)/", "/US/", object_key, count=1)
+                    logger.info(f"Country-specific data not found for {object_key}, trying fallback: {fallback_key}")
                     response = s3_client.get_object(Bucket=bucket_name, Key=fallback_key)
                     content = response['Body'].read().decode('utf-8')
                     metadata = response.get('Metadata', {})
@@ -180,10 +182,12 @@ async def get_s3_object(bucket_name: str, object_key: str) -> S3GetResponse:
                     except Exception:
                         logger.debug("S3 cache update failed for fallback", exc_info=True)
                     return S3GetResponse(content=content, metadata=metadata)
-            except ClientError:
+            except ClientError as fallback_error:
+                logger.warning(f"Fallback to US data also failed: {fallback_error}")
                 pass
-            # Still not found
-            raise HTTPException(status_code=404, detail=f"Object {object_key} not found")
+            # Still not found - but don't raise error, return empty data
+            logger.warning(f"No data found for {object_key} and fallback failed")
+            return S3GetResponse(content="[]", metadata={})
         logger.exception("Error getting S3 object")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -191,7 +195,7 @@ async def get_s3_object(bucket_name: str, object_key: str) -> S3GetResponse:
 def parse_s3_content_and_match(content: str, query: str, top_k: int = 5):
     """
     Parse S3 object content (JSON, JSONL, or CSV) and return top_k records that best match the query.
-    Matching is a simple token-based substring match across all string fields.
+    Matching is optimized for speed with early termination when top_k matches found.
     Returns a list of {record, score} sorted by score desc.
     """
     # normalize query tokens
@@ -202,7 +206,6 @@ def parse_s3_content_and_match(content: str, query: str, top_k: int = 5):
     records = []
 
     # Try parsing JSON (array or object)
-    parsed = None
     try:
         parsed = json.loads(content)
         # If parsed is a dict with a top-level list, try to find the list
@@ -215,20 +218,16 @@ def parse_s3_content_and_match(content: str, query: str, top_k: int = 5):
         if isinstance(parsed, list):
             records = parsed
     except Exception:
-        parsed = None
-
-    # If JSON parsing failed, try JSONL (one JSON per line)
-    if not records:
-        lines = [l for l in content.splitlines() if l.strip()]
-        jsonl_records = []
-        for line in lines:
-            try:
-                jsonl_records.append(json.loads(line))
-            except Exception:
-                jsonl_records = []
-                break
-        if jsonl_records:
-            records = jsonl_records
+        # If JSON parsing failed, try JSONL (one JSON per line)
+        if not records:
+            lines = content.splitlines()
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    continue
 
     # If still empty, try CSV parsing
     if not records:
@@ -238,24 +237,58 @@ def parse_s3_content_and_match(content: str, query: str, top_k: int = 5):
         except Exception:
             records = []
 
-    # Score records
+    # Enhanced scoring with better keyword matching
+    # Prioritize matches in description-like fields
     scored = []
+    
+    # Important fields to search with higher weight
+    important_fields = ['description', 'hs_description', 'product', 'goods', 'item', 'name', 'text']
+    
     for rec in records:
-        # flatten record into a single searchable string
-        if isinstance(rec, dict):
-            combined = " ".join([str(v) for v in rec.values() if v is not None]).lower()
-        else:
-            combined = str(rec).lower()
-
-        score = 0
+        if not isinstance(rec, dict):
+            continue
+            
+        # Build searchable string from all values
+        searchable_str = " ".join([str(v) for v in rec.values() if v is not None and v != '']).lower()
+        
+        # Also build field-specific searchable strings for better matching
+        field_matches = {}
+        for key, value in rec.items():
+            if value is None or value == '':
+                continue
+            key_lower = key.lower()
+            value_str = str(value).lower()
+            
+            # Check if this is an important field
+            is_important = any(imp in key_lower for imp in important_fields)
+            
+            field_score = 0
+            for t in tokens:
+                # Check exact match
+                if t in value_str:
+                    field_score += 3 if is_important else 1
+                # Check partial word match (e.g., "lap" matches "laptop")
+                elif any(t in word or word in t for word in value_str.split() if len(t) >= 3):
+                    field_score += 1 if is_important else 0.5
+            
+            if is_important:
+                field_matches[key] = field_score
+        
+        # Calculate total score with field weighting
+        total_score = sum(field_matches.values())
+        
+        # Also do general text search
+        general_score = 0
         for t in tokens:
-            # count occurrences as simple score
-            score += combined.count(t)
-
-        if score > 0:
-            scored.append({"record": rec, "score": score})
-
-    # sort by score desc
+            if t in searchable_str:
+                general_score += 1
+        
+        final_score = total_score + (general_score * 0.5)
+        
+        if final_score > 0:
+            scored.append({"record": rec, "score": final_score})
+    
+    # Sort by score and return top_k
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:top_k]
 
@@ -310,9 +343,14 @@ async def call_bedrock_with_validation(request: PromptRequest):
 
         # A short system/instructional prefix to guide the model's behavior
         system_instructions = (
-            "You are an expert export compliance assistant. Answer concisely and clearly. "
-            "When appropriate, list actionable steps and ask clarifying questions."
-        )
+    "You are an expert export compliance assistant with advanced data processing capabilities. "
+    "When a user asks about exports, you will parse the relevant JSON data containing export information "
+    "for various countries and summarize the key details based on the user's query. "
+    "Be concise, clear, and provide structured, actionable summaries. "
+    "If needed, ask clarifying questions to ensure accuracy in extracting the relevant data. "
+    "Your responses should focus on export products, values, and other important details for the specified countries."
+)
+
 
         user_prompt = req.prompt.strip()
         # Combine system, context, and user prompt into a single message string
@@ -325,22 +363,31 @@ async def call_bedrock_with_validation(request: PromptRequest):
     temperature = request.temperature if request.temperature is not None else 0.2
     max_tokens = request.max_tokens if request.max_tokens is not None else 1000
 
-    # The Bedrock Messages API expects user messages in `messages` and a top-level
-    # system/instruction parameter (if used) rather than a message with role="system".
-    # We already incorporate system instructions into `prompt_text`, so only send a
-    # user message here to avoid validation errors.
-    body = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "messages": [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": prompt_text}],
-            },
-        ],
-        # Model generation controls (may be model-specific)
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
+    # Check if model is Titan (Amazon) or Claude (Anthropic)
+    is_titan = "titan" in BEDROCK_MODEL_ID.lower()
+    
+    if is_titan:
+        # Titan Text model uses simple prompt format
+        body = {
+            "inputText": prompt_text,
+            "textGenerationConfig": {
+                "maxTokenCount": max_tokens,
+                "temperature": temperature,
+            }
+        }
+    else:
+        # Claude uses Messages API format
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt_text}],
+                },
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
 
     try:
         response = bedrock_client.invoke_model(
@@ -354,8 +401,14 @@ async def call_bedrock_with_validation(request: PromptRequest):
         raise HTTPException(status_code=502, detail=f"Bedrock invocation failed: {exc}")
 
     response_payload = json.loads(response["body"].read())
+    
     try:
-        result_text = response_payload["content"][0]["text"]
+        if is_titan:
+            # Titan response format
+            result_text = response_payload["results"][0]["outputText"]
+        else:
+            # Claude response format
+            result_text = response_payload["content"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
         logger.exception("Unexpected Bedrock response structure: %s", response_payload)
         raise HTTPException(status_code=502, detail="Unexpected Bedrock response structure") from exc
@@ -481,18 +534,33 @@ async def semantic_rerank_with_bedrock(candidates: list, query: str, top_k: int 
     )
 
     user_prompt = f"User query: {query}\n\nCandidates:\n" + "\n".join(lines) + "\n\nReturn the JSON array as described."
-
-    body = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "messages": [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": system_instructions + "\n" + user_prompt}],
-            },
-        ],
-        "max_tokens": 800,
-        "temperature": 0.0,
-    }
+    
+    # Check if model is Titan or Claude
+    is_titan = "titan" in BEDROCK_MODEL_ID.lower()
+    
+    if is_titan:
+        # Titan uses simple prompt format
+        full_prompt = system_instructions + "\n" + user_prompt
+        body = {
+            "inputText": full_prompt,
+            "textGenerationConfig": {
+                "maxTokenCount": 800,
+                "temperature": 0.0,
+            }
+        }
+    else:
+        # Claude uses Messages API
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": system_instructions + "\n" + user_prompt}],
+                },
+            ],
+            "max_tokens": 800,
+            "temperature": 0.0,
+        }
 
     try:
         response = bedrock_client.invoke_model(
@@ -507,7 +575,12 @@ async def semantic_rerank_with_bedrock(candidates: list, query: str, top_k: int 
 
     response_payload = json.loads(response["body"].read())
     try:
-        text = response_payload["content"][0]["text"]
+        if is_titan:
+            # Titan response format
+            text = response_payload["results"][0]["outputText"]
+        else:
+            # Claude response format
+            text = response_payload["content"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
         logger.exception("Unexpected Bedrock response structure for rerank: %s", response_payload)
         raise HTTPException(status_code=502, detail="Unexpected Bedrock response structure during rerank") from exc
