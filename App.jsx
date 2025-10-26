@@ -139,15 +139,40 @@ function App() {
     })
   }
 
+  const handleQuickSearch = () => {
+    if (!formData.companyDetails.trim()) {
+      alert('Please enter a product to search for')
+      return
+    }
+    // Navigate with a flag to indicate global search mode
+    navigate('/results', { 
+      state: { 
+        formData: { 
+          ...formData, 
+          initialQuery: formData.companyDetails,
+          exportLocations: formData.exportLocations.length > 0 ? formData.exportLocations : ['Global Search']
+        },
+        globalSearchMode: true
+      } 
+    })
+  }
+
   const handleSubmit = (e) => {
     e.preventDefault()
     if (formData.exportLocations.length === 0) {
-      alert('Please select at least one export location')
+      alert('Please select at least one export location for country-specific search')
       return
     }
-    // Navigate immediately for faster perceived load; use raw input as initialQuery.
-    // Results page will run fast lookups immediately and do Claude summarization there.
-    navigate('/results', { state: { formData: { ...formData, initialQuery: formData.companyDetails } } })
+    // Navigate for country-specific search - explicitly set globalSearchMode to false
+    navigate('/results', { 
+      state: { 
+        formData: { 
+          ...formData, 
+          initialQuery: formData.companyDetails 
+        },
+        globalSearchMode: false  // Explicitly set to false for country-specific search
+      } 
+    })
   }
 
   // Navigation is manual — user must click the Create button to go to results.
@@ -200,15 +225,15 @@ function App() {
       <div className="max-w-2xl mx-auto">
         <div className="bg-[#1f1f1f] rounded-2xl shadow-xl p-8 border border-[#2a2a2a] space-y-10">
           <div className="text-center mb-8">
-            <h1 className="text-4xl font-bold text-gray-100 mb-2">Project</h1>
-            <h2 className="text-xl text-gray-300 mb-1">What our company does:</h2>
-            <h3 className="text-lg text-gray-400">Use cases:</h3>
+            <h1 className="text-4xl font-bold text-gray-100 mb-2">Trade Data Search</h1>
+            <h2 className="text-xl text-gray-300 mb-1">Search tariff and trade data across the entire database</h2>
+            <h3 className="text-lg text-gray-400">Find product tariffs, duties, and trade regulations</h3>
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-6">
             <div>
               <label htmlFor="mainInput" className="block text-sm font-medium text-gray-200 mb-2">
-                Enter your product that might have tariffs in the United States
+                Enter your product to search for tariffs and trade data
               </label>
               <input
                 id="mainInput"
@@ -218,8 +243,11 @@ function App() {
                 onChange={e => setFormData(prev => ({ ...prev, companyDetails: e.target.value }))}
                 required
                 className="w-full px-4 py-3 border border-[#303030] rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition duration-200 outline-none bg-[#121212] text-gray-100 placeholder:text-gray-500"
-                placeholder="Type your product, or keywords here"
+                placeholder="e.g., laptops, steel pipes, clothing, automobiles..."
               />
+              <p className="text-xs text-gray-400 mt-1">
+                The system will search across the entire trade database for relevant tariff information
+              </p>
             </div>
 
             <div>
@@ -252,12 +280,31 @@ function App() {
               </div>
             </div>
 
-            <button
-              type="submit"
-              className="w-full bg-red-600 text-white py-3 px-6 rounded-lg font-semibold hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 focus:ring-offset-[#1f1f1f] transition duration-200 transform hover:scale-[1.02]"
-            >
-              Create
-            </button>
+            <div className="space-y-3">
+              <button
+                type="button"
+                onClick={handleQuickSearch}
+                className="w-full bg-blue-600 text-white py-3 px-6 rounded-lg font-semibold hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-[#1f1f1f] transition duration-200 transform hover:scale-[1.02]"
+              >
+                Quick Global Search
+              </button>
+              
+              <div className="relative">
+                <div className="absolute inset-0 flex items-center">
+                  <div className="w-full border-t border-gray-600"></div>
+                </div>
+                <div className="relative flex justify-center text-sm">
+                  <span className="px-2 bg-[#1f1f1f] text-gray-400">or</span>
+                </div>
+              </div>
+              
+              <button
+                type="submit"
+                className="w-full bg-red-600 text-white py-3 px-6 rounded-lg font-semibold hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 focus:ring-offset-[#1f1f1f] transition duration-200 transform hover:scale-[1.02]"
+              >
+                Search by Country
+              </button>
+            </div>
           </form>
 
           {/* Removed: separate Ask Claude section. Single input drives Claude analysis on submit */}
