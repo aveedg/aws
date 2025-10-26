@@ -15,6 +15,7 @@ function App() {
   const [claudeAnswer, setClaudeAnswer] = useState('')
   const [claudeLoading, setClaudeLoading] = useState(false)
   const [claudeError, setClaudeError] = useState(null)
+  const [claudeDebug, setClaudeDebug] = useState('')
 
   const allCountries = [
     'Afghanistan', 'Albania', 'Algeria', 'Andorra', 'Angola', 'Antigua and Barbuda', 'Argentina', 'Armenia', 'Australia', 'Austria',
@@ -149,7 +150,11 @@ function App() {
   }
 
   const handleClaudeSubmit = async (e) => {
+    console.log('submitted!')
+    setClaudeDebug('submitted!')
+    setTimeout(() => setClaudeDebug(''), 1500)
     e.preventDefault()
+    
     if (!claudePrompt.trim()) {
       return
     }
@@ -159,20 +164,28 @@ function App() {
     setClaudeAnswer('')
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/bedrock`, {
+      // First, check the content through the AI validation endpoint
+      const response = await fetch(`${API_BASE_URL}/api/check-ai`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: claudePrompt })
+        body: JSON.stringify({
+          prompt: claudePrompt,
+          companyDetails: formData.companyDetails,
+          companyLocation: formData.companyLocation,
+          exportLocations: formData.exportLocations
+        })
       })
 
       if (!response.ok) {
         const detail = await response.json().catch(() => ({}))
-        throw new Error(detail.detail ?? 'Claude request failed')
+        throw new Error(detail.detail ?? 'AI validation failed')
       }
 
+      // If validation passes, we get the response directly (endpoint handles both validation and Bedrock call)
       const data = await response.json()
       setClaudeAnswer(data.result)
     } catch (error) {
+      console.error('Error:', error)
       setClaudeError(error.message)
     } finally {
       setClaudeLoading(false)
@@ -297,6 +310,10 @@ function App() {
                   Clear
                 </button>
               </div>
+
+              {claudeDebug && (
+                <p className="mt-2 text-sm text-green-300">{claudeDebug}</p>
+              )}
             </form>
 
             {claudeError && (

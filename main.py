@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from dotenv import load_dotenv
 
 import boto3
 from fastapi import FastAPI, HTTPException
@@ -12,10 +13,14 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+        # Allow all origins during local development to support Codespaces / preview URLs.
+        # In production, set a restrictive list or use environment configuration.
+        allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+load_dotenv()
 
 # BEDROCK & AWS CONFIGURATION VIA ENVIRONMENT VARIABLES
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
@@ -34,25 +39,48 @@ missing_env = [
 ]
 
 if missing_env:
-    raise RuntimeError(
-        "Missing required environment variables for Bedrock configuration: "
-        + ", ".join(missing_env)
+    # Don't raise in dev/stub mode; log a warning so server can still start locally.
+    logger.warning(
+        "Missing required environment variables for Bedrock configuration: %s. Running in stub/dev mode.",
+        ", ".join(missing_env),
     )
 
 
-# Set up Bedrock client with specified credentials
-bedrock_client = boto3.client(
-    'bedrock-runtime',
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION
-)
+# Set up Bedrock client with specified credentials (only if present)
+bedrock_client = None
+if not missing_env:
+    bedrock_client = boto3.client(
+        'bedrock-runtime',
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION
+    )
 
 class PromptRequest(BaseModel):
     prompt: str
+    companyDetails: str | None = None
+    companyLocation: str | None = None
+    exportLocations: list[str] | None = None
+
+@app.post("/api/check-ai")
+async def check_ai_content(request: PromptRequest):
+    # First, validate the content through an AI check
+    is_valid = True  # You can add your validation logic here
+    validation_message = "Content looks good"
+    
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=validation_message)
+    
+    # If validation passes, proceed with Bedrock call
+    return await call_bedrock_with_validation(request)
+
+@app.options("/api/check-ai")
+async def options_check_ai():
+    return {}  # Return empty response for OPTIONS requests
+
 
 @app.post("/api/bedrock")
-def call_bedrock(request: PromptRequest):
+async def call_bedrock_with_validation(request: PromptRequest):
     body = {
         "anthropic_version": "bedrock-2023-05-31",
         "messages": [
@@ -93,4 +121,16 @@ def call_bedrock(request: PromptRequest):
 def root():
     return {"message": "Hello from FastAPI and AWS Bedrock!"}
 
-# To run: uvicorn main:app --reload
+# Quick test function for direct script execution
+async def test_ai_check():
+    test_request = PromptRequest(prompt="Hello what is your name")
+    result = await check_ai_content(test_request)
+    print("Test result:", result)
+
+# Only run test if script is run directly (not through uvicorn)
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(test_ai_check())
+
+# To run server: uvicorn main:app --reload
+# To test locally: python3 main.py
