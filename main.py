@@ -1,6 +1,9 @@
 import json
 import logging
 import os
+import csv
+import io
+import re
 from typing import List, Optional
 from dotenv import load_dotenv
 
@@ -86,6 +89,13 @@ class S3GetResponse(BaseModel):
     content: str
     metadata: dict
 
+class LookupRequest(BaseModel):
+    bucket: str
+    key: str
+    query: str
+    country: str | None = None
+    top_k: Optional[int] = 5
+
 async def list_s3_objects(bucket_name: str, prefix: Optional[str] = None) -> S3ListResponse:
     """
     List objects in an S3 bucket with optional prefix filtering
@@ -132,6 +142,78 @@ async def get_s3_object(bucket_name: str, object_key: str) -> S3GetResponse:
             raise HTTPException(status_code=404, detail=f"Object {object_key} not found")
         logger.exception("Error getting S3 object")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def parse_s3_content_and_match(content: str, query: str, top_k: int = 5):
+    """
+    Parse S3 object content (JSON, JSONL, or CSV) and return top_k records that best match the query.
+    Matching is a simple token-based substring match across all string fields.
+    Returns a list of {record, score} sorted by score desc.
+    """
+    # normalize query tokens
+    tokens = [t.lower() for t in re.findall(r"\w{2,}", query)]
+    if not tokens:
+        return []
+
+    records = []
+
+    # Try parsing JSON (array or object)
+    parsed = None
+    try:
+        parsed = json.loads(content)
+        # If parsed is a dict with a top-level list, try to find the list
+        if isinstance(parsed, dict):
+            # heuristics: find first list value
+            for v in parsed.values():
+                if isinstance(v, list):
+                    parsed = v
+                    break
+        if isinstance(parsed, list):
+            records = parsed
+    except Exception:
+        parsed = None
+
+    # If JSON parsing failed, try JSONL (one JSON per line)
+    if not records:
+        lines = [l for l in content.splitlines() if l.strip()]
+        jsonl_records = []
+        for line in lines:
+            try:
+                jsonl_records.append(json.loads(line))
+            except Exception:
+                jsonl_records = []
+                break
+        if jsonl_records:
+            records = jsonl_records
+
+    # If still empty, try CSV parsing
+    if not records:
+        try:
+            reader = csv.DictReader(io.StringIO(content))
+            records = [row for row in reader]
+        except Exception:
+            records = []
+
+    # Score records
+    scored = []
+    for rec in records:
+        # flatten record into a single searchable string
+        if isinstance(rec, dict):
+            combined = " ".join([str(v) for v in rec.values() if v is not None]).lower()
+        else:
+            combined = str(rec).lower()
+
+        score = 0
+        for t in tokens:
+            # count occurrences as simple score
+            score += combined.count(t)
+
+        if score > 0:
+            scored.append({"record": rec, "score": score})
+
+    # sort by score desc
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_k]
 
 async def upload_to_s3(bucket_name: str, object_key: str, content: str, metadata: Optional[dict] = None) -> dict:
     """
@@ -257,6 +339,145 @@ async def upload_object(bucket: str, key: str, content: str, metadata: Optional[
     """
     return await upload_to_s3(bucket, key, content, metadata)
 
+
+@app.post("/api/lookup")
+async def lookup_from_s3(request: LookupRequest):
+    """
+    Lookup product/tariff info by reading an S3 file and matching the user's query.
+    The S3 file may be JSON array, JSONL (one JSON per line), or CSV.
+    """
+    # Fetch content from S3
+    s3_resp = await get_s3_object(request.bucket, request.key)
+    content = s3_resp.content
+
+    # First do a fast token-based filter (wider candidate set)
+    candidate_k = max(50, (request.top_k or 5) * 10)
+    candidates = parse_s3_content_and_match(content, request.query, top_k=candidate_k)
+
+    # If a specific country was requested, filter candidates to that country
+    def record_matches_country(rec, country: str) -> bool:
+        if not country:
+            return True
+        if rec is None:
+            return False
+        c_lower = country.lower()
+        # If record is dict, search values for the country string
+        if isinstance(rec, dict):
+            for v in rec.values():
+                try:
+                    if v and c_lower in str(v).lower():
+                        return True
+                except Exception:
+                    continue
+        else:
+            try:
+                if c_lower in str(rec).lower():
+                    return True
+            except Exception:
+                return False
+        return False
+
+    if getattr(request, 'country', None):
+        candidates = [c for c in candidates if record_matches_country(c.get('record'), request.country)]
+
+    # If Bedrock is configured, use semantic reranking to get better relevance
+    if bedrock_client and BEDROCK_MODEL_ID:
+        try:
+            reranked = await semantic_rerank_with_bedrock(candidates, request.query, top_k=request.top_k or 5)
+            return {"matches": reranked}
+        except Exception:
+            # On any failure, fall back to token matches limited to top_k
+            logger.exception("Semantic rerank failed, falling back to token matches")
+            return {"matches": candidates[: (request.top_k or 5)]}
+
+    # Bedrock not available — return token matches
+    return {"matches": candidates[: (request.top_k or 5)]}
+
+
+async def semantic_rerank_with_bedrock(candidates: list, query: str, top_k: int = 5) -> list:
+    """
+    Use the Bedrock model to semantically rerank candidate records.
+    Expects `candidates` to be a list of dicts like {record: {...}, score: n}.
+    Returns a list of {record, score} where score is a semantic relevance score (float 0-1).
+    """
+    if not bedrock_client:
+        raise HTTPException(status_code=503, detail="Bedrock client not configured")
+
+    # Build a compact text representation of candidates
+    lines = []
+    for i, c in enumerate(candidates[: 100]):
+        rec = c.get("record")
+        if isinstance(rec, dict):
+            entries = [f"{k}: {v}" for k, v in list(rec.items())[:8]]
+            lines.append(f"{i+1}. {', '.join(entries)}")
+        else:
+            lines.append(f"{i+1}. {str(rec)}")
+
+    system_instructions = (
+        "You are an assistant that ranks items by relevance to a user's query.\n"
+        "Given the user query and a numbered list of candidate records, return a JSON array of objects with keys: index (int), score (0-1 float), and explanation (short text).\n"
+        "Only return valid JSON — do not include any additional text.\n"
+    )
+
+    user_prompt = f"User query: {query}\n\nCandidates:\n" + "\n".join(lines) + "\n\nReturn the JSON array as described."
+
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": system_instructions + "\n" + user_prompt}],
+            },
+        ],
+        "max_tokens": 800,
+        "temperature": 0.0,
+    }
+
+    try:
+        response = bedrock_client.invoke_model(
+            modelId=BEDROCK_MODEL_ID,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(body),
+        )
+    except Exception as exc:
+        logger.exception("Bedrock invoke_model failed for rerank")
+        raise HTTPException(status_code=502, detail=f"Bedrock invocation failed: {exc}")
+
+    response_payload = json.loads(response["body"].read())
+    try:
+        text = response_payload["content"][0]["text"]
+    except (KeyError, IndexError, TypeError) as exc:
+        logger.exception("Unexpected Bedrock response structure for rerank: %s", response_payload)
+        raise HTTPException(status_code=502, detail="Unexpected Bedrock response structure during rerank") from exc
+
+    # Parse JSON from model output (may be noisy, try to extract JSON substring)
+    try:
+        parsed = json.loads(text.strip())
+    except Exception:
+        m = re.search(r"(\[.*\])", text, re.S)
+        if m:
+            try:
+                parsed = json.loads(m.group(1))
+            except Exception:
+                logger.exception("Failed to parse JSON block from model output")
+                raise HTTPException(status_code=502, detail="Failed to parse model JSON output for rerank")
+        else:
+            logger.exception("No JSON array found in model output")
+            raise HTTPException(status_code=502, detail="No JSON array found in model output")
+
+    # parsed should be list of {index, score, explanation}
+    results = []
+    for item in parsed[:top_k]:
+        idx = int(item.get("index", 0)) - 1
+        score = float(item.get("score", 0))
+        explanation = item.get("explanation", "")
+        if 0 <= idx < len(candidates):
+            rec = candidates[idx]["record"]
+            results.append({"record": rec, "score": score, "explanation": explanation})
+
+    return results
+
 @app.get("/")
 def root():
     return {"message": "Hello from FastAPI and AWS Bedrock!"}
@@ -294,6 +515,7 @@ async def test_s3_operations():
 
         print("\n3. Testing get object...")
         get_result = await get_s3_object(test_bucket, test_key)
+        get_result = await get_s3_object(test_bucket, "trade-data/normal/US/Oct15.2025.jsonl")
         print(f"Retrieved content: {get_result.content}")
         print(f"Retrieved metadata: {get_result.metadata}")
 
