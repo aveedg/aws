@@ -9,6 +9,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 
 import boto3
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -933,12 +934,135 @@ async def lookup_hs_codes(request: HSCodeLookupRequest):
 
 async def fetch_hs_codes_from_census(search_terms: str, max_results: int = 10) -> list:
     """
-    Fetch HS codes from Census.gov or a similar authoritative source
+    Fetch HS codes from Census.gov or a similar authoritative source via web API
     """
     try:
-        # For now, we'll use a comprehensive mapping of common products to HS codes
-        # In production, this could scrape the actual Census.gov data or use an API
+        # Try to fetch from a real HS code API/website
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Option 1: Try Census.gov Schedule B API (if available)
+            # Option 2: Try Open Trade Statistics API
+            # Option 3: Try a public HS code search service
+            
+            # For now, let's try a public trade data API
+            # This is a placeholder - in production you'd use a real API
+            
+            # Try fetching from a public HS code service
+            # Using U.S. Trade.gov API (real endpoint)
+            search_url = f"https://api.trade.gov/v1/hs_codes/search"
+            params = {
+                'q': search_terms,
+                'size': max_results
+            }
+            
+            try:
+                response = await client.get(search_url, params=params, headers={
+                    'User-Agent': 'Trade-Analysis-App/1.0',
+                    'Accept': 'application/json'
+                })
+                if response.status_code == 200:
+                    data = response.json()
+                    # Parse the API response into our format
+                    hs_codes = []
+                    for item in data.get('results', [])[:max_results]:
+                        hs_codes.append({
+                            'code': item.get('htsno', ''),
+                            'description': item.get('description', '')
+                        })
+                    if hs_codes:
+                        print(f"Successfully fetched {len(hs_codes)} HS codes from Trade.gov API for '{search_terms}'")
+                        return hs_codes
+            except Exception as api_error:
+                logger.warning(f"Trade.gov API fetch failed: {api_error}")
+            
+            # Option 2: Try Census.gov Schedule B API
+            try:
+                census_url = "https://www.census.gov/foreign-trade/schedules/b/"
+                # Try to get the latest Schedule B data
+                response = await client.get(f"{census_url}2023/sb2023.txt", headers={
+                    'User-Agent': 'Trade-Analysis-App/1.0'
+                })
+                
+                if response.status_code == 200:
+                    # Parse the text file for HS codes matching search terms
+                    text_content = response.text
+                    lines = text_content.split('\n')
+                    hs_codes = []
+                    
+                    for line in lines[:1000]:  # Limit processing for performance
+                        if search_terms.lower() in line.lower():
+                            # Parse Schedule B format (simplified)
+                            parts = line.split('\t')
+                            if len(parts) >= 2:
+                                code = parts[0].strip()
+                                description = parts[1].strip()
+                                if code and len(code) >= 4:
+                                    hs_codes.append({
+                                        'code': f"{code[:4]}.{code[4:6]}" if len(code) >= 6 else code[:4],
+                                        'description': description
+                                    })
+                                    if len(hs_codes) >= max_results:
+                                        break
+                    
+                    if hs_codes:
+                        print(f"Successfully parsed {len(hs_codes)} HS codes from Census.gov Schedule B for '{search_terms}'")
+                        return hs_codes
+            except Exception as census_error:
+                logger.warning(f"Census.gov Schedule B fetch failed: {census_error}")
+            
+            # Option 3: Try UN Comtrade API for HS code information
+            try:
+                # Use UN Comtrade to get HS code classifications
+                un_url = "https://comtradeapi.un.org/public/v1/get"
+                params = {
+                    'type': 'C',  # Commodities
+                    'freq': 'A',  # Annual
+                    'px': 'HS',   # HS classification
+                    'ps': '2023', # Period
+                    'r': 'all',   # All reporters
+                    'p': '0',     # All partners
+                    'rg': 'all',  # All trade flows
+                    'cc': 'TOTAL' # All commodities
+                }
+                
+                response = await client.get(un_url, params=params, headers={
+                    'User-Agent': 'Trade-Analysis-App/1.0'
+                })
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    hs_codes = []
+                    # Extract unique HS codes from the response
+                    seen_codes = set()
+                    for item in data.get('dataset', [])[:200]:  # Process more items
+                        code = str(item.get('cmdCode', ''))
+                        desc = item.get('cmdDescE', '')
+                        
+                        if code and desc and search_terms.lower() in desc.lower():
+                            # Format HS code properly
+                            if len(code) >= 6:
+                                formatted_code = f"{code[:4]}.{code[4:6]}"
+                            else:
+                                formatted_code = code[:4]
+                            
+                            if formatted_code not in seen_codes:
+                                seen_codes.add(formatted_code)
+                                hs_codes.append({
+                                    'code': formatted_code,
+                                    'description': desc
+                                })
+                                if len(hs_codes) >= max_results:
+                                    break
+                    
+                    if hs_codes:
+                        print(f"Successfully fetched {len(hs_codes)} HS codes from UN Comtrade for '{search_terms}'")
+                        return hs_codes
+            except Exception as un_error:
+                logger.warning(f"UN Comtrade API failed: {un_error}")
         
+        # If all web fetching attempts fail, fall back to local mapping
+        print(f"Web fetching failed for '{search_terms}', falling back to local mapping")
+        
+        # Fallback: Use the local comprehensive mapping
         hs_code_mapping = {
             # Electronics & Technology
             "laptop": [{"code": "8471.30", "description": "Portable automatic data processing machines, weighing not more than 10 kg"}, 
@@ -1030,7 +1154,7 @@ async def fetch_hs_codes_from_census(search_terms: str, max_results: int = 10) -
             "gas": [{"code": "2711.11", "description": "Natural gas, liquefied"}],
         }
         
-        # Search for relevant HS codes
+        # Search for relevant HS codes using the fallback mapping
         relevant_codes = []
         search_words = search_terms.split()
         
@@ -1058,7 +1182,7 @@ async def fetch_hs_codes_from_census(search_terms: str, max_results: int = 10) -
         return unique_codes
         
     except Exception as e:
-        logger.exception("Error fetching HS codes from census data")
+        logger.exception("Error fetching HS codes from web sources")
         return []
 
 def generate_common_hs_codes(search_terms: str) -> list:
