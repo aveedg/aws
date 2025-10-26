@@ -908,6 +908,9 @@ async def lookup_hs_codes(request: HSCodeLookupRequest):
             # Fallback: generate likely HS codes based on product keywords
             hs_codes = generate_common_hs_codes(search_terms)
         
+        # Print the HS codes that are returned
+        print(f"HS codes returned for query '{request.query}': {[code['code'] for code in hs_codes]}")
+        
         return {
             "query": request.query,
             "hs_codes": hs_codes,
@@ -919,6 +922,7 @@ async def lookup_hs_codes(request: HSCodeLookupRequest):
         logger.exception(f"Error looking up HS codes for {request.query}")
         # Return common fallback codes
         fallback_codes = generate_common_hs_codes(request.query.lower())
+        print(f"Fallback HS codes returned for query '{request.query}' due to error: {[code['code'] for code in fallback_codes]}")
         return {
             "query": request.query,
             "hs_codes": fallback_codes,

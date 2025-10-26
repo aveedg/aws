@@ -1,6 +1,6 @@
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useState, useMemo, useEffect } from 'react'
-const API_BASE_URL = import.meta.env?.VITE_API_BASE_URL ?? 'http://127.0.0.1:8001'
+const API_BASE_URL = import.meta.env?.VITE_API_BASE_URL ?? 'http://127.0.0.1:8003'
 import WorldMap, { normalizeCountryName } from './WorldMap'
 
 // Map countries to their S3 key paths
@@ -607,6 +607,7 @@ function CountrySummaryBox({ initialQuery = '', initialBucket = 'tsinfo', initia
       
       if (resp.ok) {
         const data = await resp.json()
+        console.log('HS codes returned from API:', data.hs_codes)
         setHsCodes(data.hs_codes || [])
         return data.hs_codes || []
       }
