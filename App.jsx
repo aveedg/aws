@@ -145,9 +145,12 @@ function App() {
       alert('Please select at least one export location')
       return
     }
-    console.log('Form submitted:', formData)
-    navigate('/results', { state: { formData } })
+    // Navigate immediately for faster perceived load; use raw input as initialQuery.
+    // Results page will run fast lookups immediately and do Claude summarization there.
+    navigate('/results', { state: { formData: { ...formData, initialQuery: formData.companyDetails } } })
   }
+
+  // Navigation is manual — user must click the Create button to go to results.
 
   const handleClaudeSubmit = async (e) => {
     console.log('submitted!')
@@ -204,41 +207,18 @@ function App() {
 
           <form onSubmit={handleSubmit} className="space-y-6">
             <div>
-              <label htmlFor="companyLocation" className="block text-sm font-medium text-gray-200 mb-2">
-                Company Location
+              <label htmlFor="mainInput" className="block text-sm font-medium text-gray-200 mb-2">
+                Enter your product that might have tariffs in the United States
               </label>
-              <select
-                id="companyLocation"
-                name="companyLocation"
-                value={formData.companyLocation}
-                onChange={handleInputChange}
-                required
-                className="w-full px-4 py-3 border border-[#303030] rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition duration-200 outline-none bg-[#121212] text-gray-100 cursor-pointer"
-              >
-                <option value="">Select a country</option>
-                {allCountries.map(country => (
-                  <option key={country} value={country}>{country}</option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <h4 className="text-sm font-medium text-gray-200 mb-2">Please include the following details:</h4>
-              <ul className="mb-3 ml-4 list-disc text-sm text-gray-300 space-y-1">
-                {detailPrompts.map(prompt => (
-                  <li key={prompt}>{prompt}</li>
-                ))}
-              </ul>
-              <label htmlFor="companyDetails" className="sr-only">Company Details</label>
-              <textarea
-                id="companyDetails"
-                name="companyDetails"
+              <input
+                id="mainInput"
+                name="mainInput"
+                type="text"
                 value={formData.companyDetails}
-                onChange={handleInputChange}
-                placeholder="Provide your company details here"
+                onChange={e => setFormData(prev => ({ ...prev, companyDetails: e.target.value }))}
                 required
-                rows="6"
                 className="w-full px-4 py-3 border border-[#303030] rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition duration-200 outline-none bg-[#121212] text-gray-100 placeholder:text-gray-500"
+                placeholder="Type your product, or keywords here"
               />
             </div>
 
@@ -280,55 +260,7 @@ function App() {
             </button>
           </form>
 
-          <section className="bg-[#141414] border border-[#2a2a2a] rounded-xl p-6">
-            <h4 className="text-xl font-semibold text-gray-100 mb-4">Ask Claude</h4>
-            <form onSubmit={handleClaudeSubmit} className="space-y-4">
-              <textarea
-                value={claudePrompt}
-                onChange={(e) => setClaudePrompt(e.target.value)}
-                placeholder="Ask a question for Claude"
-                rows="4"
-                className="w-full px-4 py-3 border border-[#303030] rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition duration-200 outline-none bg-[#121212] text-gray-100 placeholder:text-gray-500"
-              />
-              <div className="flex items-center gap-3">
-                <button
-                  type="submit"
-                  disabled={claudeLoading}
-                  className="bg-indigo-600 disabled:opacity-60 text-white py-2 px-5 rounded-lg font-medium hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-[#141414] transition"
-                >
-                  {claudeLoading ? 'Thinking…' : 'Ask Claude'}
-                </button>
-                <button
-                  type="button"
-                  className="text-sm text-gray-400 hover:text-gray-200 transition"
-                  onClick={() => {
-                    setClaudePrompt('')
-                    setClaudeAnswer('')
-                    setClaudeError(null)
-                  }}
-                >
-                  Clear
-                </button>
-              </div>
-
-              {claudeDebug && (
-                <p className="mt-2 text-sm text-green-300">{claudeDebug}</p>
-              )}
-            </form>
-
-            {claudeError && (
-              <p className="mt-4 text-sm text-red-400">{claudeError}</p>
-            )}
-
-            {claudeAnswer && (
-              <div className="mt-4">
-                <h5 className="text-sm font-semibold text-gray-300 mb-2">Claude responds:</h5>
-                <pre className="whitespace-pre-wrap text-gray-100 text-sm bg-[#121212] border border-[#303030] rounded-lg p-4">
-                  {claudeAnswer}
-                </pre>
-              </div>
-            )}
-          </section>
+          {/* Removed: separate Ask Claude section. Single input drives Claude analysis on submit */}
         </div>
       </div>
     </div>

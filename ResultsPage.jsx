@@ -63,34 +63,22 @@ function ResultsPage() {
         </div>
 
         <div className="space-y-6 mb-8">
-          {formData.exportLocations.map(country => (
+          {formData.exportLocations.map((country, idx) => (
             <div key={country} className="bg-[#1f1f1f] rounded-2xl shadow-xl p-8 border border-[#2a2a2a]">
               <h2 className="text-2xl font-bold text-gray-100 mb-6 text-center border-b border-[#2f2f2f] pb-3">
                 {country}
               </h2>
 
               <div className="space-y-4 mt-6">
-                <div className="border-b border-[#2f2f2f] pb-4">
-                  <h3 className="text-sm font-medium text-gray-300 mb-1">Company Location</h3>
-                  <p className="text-lg text-gray-100">{formData.companyLocation}</p>
-                </div>
-
-                <div className="pb-4">
-                  <h3 className="text-sm font-medium text-gray-300 mb-1">Company Details</h3>
-                  <div className="text-lg text-gray-100 space-y-2">
-                    {formData.companyDetails.split('\n').map((line, index) => (
-                      <p key={`${country}-detail-${index}`}>{line}</p>
-                    ))}
-                  </div>
-                </div>
-
+                {/* Single-input flow: we no longer display company location/details here */}
                 <div className="pt-4">
                   <h3 className="text-sm font-medium text-gray-300 mb-2">Tariffs & Products for {country}</h3>
                   <LookupBox
-                    initialQuery={formData.companyDetails ?? ''}
+                    initialQuery={formData.initialQuery ?? formData.companyDetails ?? ''}
                     initialBucket={formData.s3Bucket ?? 'tsinfo'}
                     initialKeyPath={formData.s3Key ?? 'trade-data/normal/US/Oct15.2025.jsonl'}
                     country={country}
+                    autoDelay={idx * 250}
                   />
                 </div>
               </div>
@@ -113,7 +101,7 @@ function ResultsPage() {
   )
 }
 
-function LookupBox({ initialQuery = '', initialBucket = 'tsinfo', initialKeyPath = 'trade-data/normal/US/Oct15.2025.jsonl', country = null }) {
+function LookupBox({ initialQuery = '', initialBucket = 'tsinfo', initialKeyPath = 'trade-data/normal/US/Oct15.2025.jsonl', country = null, autoDelay = 0 }) {
   const [query, setQuery] = useState(initialQuery)
   const [results, setResults] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -121,7 +109,7 @@ function LookupBox({ initialQuery = '', initialBucket = 'tsinfo', initialKeyPath
   const [summary, setSummary] = useState(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
   const [summaryError, setSummaryError] = useState(null)
-  const [topK, setTopK] = useState(5)
+  const [topK] = useState(3)
   const [bucket, setBucket] = useState(initialBucket)
   const [keyPath, setKeyPath] = useState(initialKeyPath)
 
@@ -134,7 +122,7 @@ function LookupBox({ initialQuery = '', initialBucket = 'tsinfo', initialKeyPath
     const resp = await fetch(`${API_BASE_URL}/api/lookup`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bucket, key: keyPath, query, top_k: topK, country })
+      body: JSON.stringify({ bucket, key: keyPath, query, top_k: topK, country, fast: true })
       })
       if (!resp.ok) {
         const body = await resp.json().catch(() => ({}))
@@ -167,8 +155,11 @@ function LookupBox({ initialQuery = '', initialBucket = 'tsinfo', initialKeyPath
       const lines = matches.slice(0, topK).map((m, i) => {
         const rec = m.record
         if (rec && typeof rec === 'object') {
-          // pick up to 5 fields for context
-          const entries = Object.entries(rec).slice(0, 5).map(([k, v]) => `${k}: ${v}`)
+          // include only primitive fields to avoid [object Object]
+          const entries = Object.entries(rec)
+            .filter(([_, v]) => v !== null && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'))
+            .slice(0, 6)
+            .map(([k, v]) => `${k}: ${v}`)
           return `${i + 1}. ${entries.join('; ')}`
         }
         return `${i + 1}. ${String(rec)}`
@@ -179,7 +170,7 @@ function LookupBox({ initialQuery = '', initialBucket = 'tsinfo', initialKeyPath
       const resp = await fetch(`${API_BASE_URL}/api/bedrock`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, temperature: 0.2, max_tokens: 300 })
+        body: JSON.stringify({ prompt, temperature: 0.0, max_tokens: 180 })
       })
 
       if (!resp.ok) {
@@ -212,20 +203,16 @@ function LookupBox({ initialQuery = '', initialBucket = 'tsinfo', initialKeyPath
   }
 
   useEffect(() => {
-    // If a country is provided, auto-run the lookup for that country immediately
-    if (country) {
-      const combined = initialQuery ? `${initialQuery} ${country}` : country
-      setQuery(combined)
-      doLookup()
-      return
-    }
-
-    if (initialQuery && shouldAutoRun(initialQuery)) {
-      setQuery(initialQuery)
-      doLookup()
+    // Auto-run lookup; combine query with country and stagger the call
+    const combined = country ? (initialQuery ? `${initialQuery} ${country}` : country) : initialQuery
+    const trimmed = (combined || '').trim()
+    if (trimmed) {
+      setQuery(trimmed)
+      const t = setTimeout(() => doLookup(), autoDelay)
+      return () => clearTimeout(t)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialQuery, country])
+  }, [initialQuery, country, autoDelay])
 
   const renderRecord = (rec) => {
     if (rec && typeof rec === 'object' && !Array.isArray(rec)) {
@@ -242,48 +229,31 @@ function LookupBox({ initialQuery = '', initialBucket = 'tsinfo', initialKeyPath
 
   return (
     <div className="space-y-4">
-      <form onSubmit={doLookup} className="space-y-3">
-        {/* bucket/key are hidden on the results page UI but kept in state for lookups */}
-        <input type="hidden" value={bucket} />
-        <input type="hidden" value={keyPath} />
-        <textarea
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          rows={4}
-          className="w-full px-4 py-3 border border-[#303030] rounded-lg focus:ring-2 focus:ring-indigo-500 bg-[#121212] text-gray-100"
-          placeholder="Type tariff codes, product descriptions, or other keywords to search the dataset"
-        />
+      {/* Show the query as plain text, not editable */}
+      <div className="bg-[#181818] border border-[#222] rounded p-3 mb-2">
+        <span className="text-xs text-gray-400">Query:</span>
+        <div className="text-base text-gray-100 mt-1">{query}</div>
+      </div>
 
-        <div className="flex items-center gap-3">
-          <label className="text-sm text-gray-300">Top K</label>
-          <input type="number" min={1} max={50} value={topK} onChange={(e) => setTopK(Number(e.target.value))} className="w-20 px-2 py-1 rounded bg-[#121212] border border-[#303030] text-gray-100" />
-          <button type="submit" disabled={loading} className="ml-auto bg-indigo-600 text-white py-2 px-4 rounded-lg">
-            {loading ? 'Searching…' : 'Lookup'}
-          </button>
-        </div>
-      </form>
+      {(loading || (results === null && !error)) && (
+        <div className="text-sm text-gray-400">Loading...</div>
+      )}
 
       {error && <div className="text-sm text-red-400">{error}</div>}
 
       {results && (
         <div className="mt-3 space-y-3">
-          <h4 className="text-lg font-semibold">Matches ({results.length})</h4>
           {summaryLoading && <div className="text-sm text-gray-300">Summarizing results...</div>}
           {summaryError && <div className="text-sm text-red-400">Summary error: {summaryError}</div>}
           {summary && (
-            <div className="bg-[#0f1720] p-4 rounded border border-[#222] text-sm text-gray-100">
+            <div className="bg-[#0f1720] p-4 rounded border border-[#222] text-base text-gray-100">
               <h5 className="font-semibold text-gray-200 mb-2">Summary for an average user</h5>
               <div className="whitespace-pre-wrap">{summary}</div>
             </div>
           )}
 
           {results.length === 0 && <div className="text-sm text-gray-300">No matches found.</div>}
-          {results.map((m, idx) => (
-            <div key={idx} className="bg-[#141414] p-3 rounded border border-[#2a2a2a]">
-              <div className="text-sm text-gray-400 mb-2">Score: {m.score}</div>
-              <div>{renderRecord(m.record)}</div>
-            </div>
-          ))}
+          {/* Per-record raw details are hidden to avoid clutter like duty_type, rates, admin, source fields */}
         </div>
       )}
     </div>

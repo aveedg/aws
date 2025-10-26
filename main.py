@@ -27,6 +27,11 @@ app.add_middleware(
 
 load_dotenv()
 
+# Simple in-memory S3 object cache to avoid re-downloading the same file repeatedly during
+# a single session. This significantly speeds up per-country lookups that all read the same key.
+S3_CACHE: dict[tuple[str, str], dict] = {}
+S3_CACHE_TTL_SECONDS = int(os.getenv("S3_CACHE_TTL_SECONDS", "300"))  # default 5 minutes
+
 # BEDROCK & AWS CONFIGURATION VIA ENVIRONMENT VARIABLES
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
@@ -95,6 +100,8 @@ class LookupRequest(BaseModel):
     query: str
     country: str | None = None
     top_k: Optional[int] = 5
+    # If `fast` is true, return token-based matches immediately and skip semantic rerank.
+    fast: Optional[bool] = False
 
 async def list_s3_objects(bucket_name: str, prefix: Optional[str] = None) -> S3ListResponse:
     """
@@ -131,14 +138,51 @@ async def get_s3_object(bucket_name: str, object_key: str) -> S3GetResponse:
         raise HTTPException(status_code=503, detail="S3 client not configured")
 
     try:
+        # Attempt cache lookup first
+        cache_key = (bucket_name, object_key)
+        cache_entry = S3_CACHE.get(cache_key)
+        if cache_entry:
+            age = (__import__('time').time() - cache_entry.get('ts', 0))
+            if age < S3_CACHE_TTL_SECONDS:
+                return S3GetResponse(content=cache_entry['content'], metadata=cache_entry.get('metadata', {}))
+
         response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
         content = response['Body'].read().decode('utf-8')
         metadata = response.get('Metadata', {})
+
+        # Update cache
+        try:
+            S3_CACHE[cache_key] = {"content": content, "metadata": metadata, "ts": __import__('time').time()}
+        except Exception:
+            # Cache failures shouldn't break the request
+            logger.debug("S3 cache update failed", exc_info=True)
         
         return S3GetResponse(content=content, metadata=metadata)
 
     except ClientError as e:
-        if e.response['Error']['Code'] == 'NoSuchKey':
+        # If the country-specific key doesn't exist, try a fallback by replacing the country folder with US
+        try:
+            code = e.response.get('Error', {}).get('Code')
+        except Exception:
+            code = None
+        if code == 'NoSuchKey':
+            # Attempt fallback: replace /XX/ or /EU/ with /US/
+            try:
+                m = re.search(r"/(?:[A-Z]{2}|EU)/", object_key)
+                if m and '/US/' not in object_key:
+                    fallback_key = re.sub(r"/(?:[A-Z]{2}|EU)/", "/US/", object_key, count=1)
+                    response = s3_client.get_object(Bucket=bucket_name, Key=fallback_key)
+                    content = response['Body'].read().decode('utf-8')
+                    metadata = response.get('Metadata', {})
+                    # Cache fallback too
+                    try:
+                        S3_CACHE[(bucket_name, fallback_key)] = {"content": content, "metadata": metadata, "ts": __import__('time').time()}
+                    except Exception:
+                        logger.debug("S3 cache update failed for fallback", exc_info=True)
+                    return S3GetResponse(content=content, metadata=metadata)
+            except ClientError:
+                pass
+            # Still not found
             raise HTTPException(status_code=404, detail=f"Object {object_key} not found")
         logger.exception("Error getting S3 object")
         raise HTTPException(status_code=500, detail=str(e))
@@ -361,8 +405,21 @@ async def lookup_from_s3(request: LookupRequest):
         if rec is None:
             return False
         c_lower = country.lower()
-        # If record is dict, search values for the country string
+        # Common country fields to check first
+        country_keys = [
+            'country', 'destination_country', 'importing_country', 'exporting_country',
+            'dest_country', 'origin_country', 'country_name', 'iso2', 'iso3'
+        ]
         if isinstance(rec, dict):
+            # Direct key checks for structured data
+            for key in country_keys:
+                if key in rec and rec[key]:
+                    try:
+                        if c_lower in str(rec[key]).lower():
+                            return True
+                    except Exception:
+                        pass
+            # Fallback: search all values
             for v in rec.values():
                 try:
                     if v and c_lower in str(v).lower():
@@ -379,6 +436,10 @@ async def lookup_from_s3(request: LookupRequest):
 
     if getattr(request, 'country', None):
         candidates = [c for c in candidates if record_matches_country(c.get('record'), request.country)]
+
+    # If caller asked for a fast response, return token matches immediately and skip reranking.
+    if getattr(request, 'fast', False):
+        return {"matches": candidates[: (request.top_k or 5)]}
 
     # If Bedrock is configured, use semantic reranking to get better relevance
     if bedrock_client and BEDROCK_MODEL_ID:
